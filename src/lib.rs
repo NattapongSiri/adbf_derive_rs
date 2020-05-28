@@ -54,7 +54,8 @@
 //!     }
 //! }
 //! ```
-extern crate proc_macro;
+#[cfg(feature="threaded")]
+extern crate adbf_rs_threaded as adbf_rs; 
 
 use adbf_rs::{
     DBFType,
@@ -63,8 +64,7 @@ use adbf_rs::{
     read_dbf_type,
     read_header,
     foxpro::{
-        cp_mapper,
-        Field
+        cp_mapper
     }
 };
 use futures::{
@@ -114,7 +114,8 @@ use syn::{
     parse::{
         Parse,
         ParseStream
-    }
+    },
+    Visibility
 };
 
 mod foxpro;
@@ -521,30 +522,27 @@ fn get_dbf_type<P: AsRef<Path> + Debug + Display>(path: P) -> DBFType {
     read_dbf_type(&path).expect("Fail to read dbf file")
 }
 
-fn generate_foxpro_rec_struct(table: &ItemStruct, options: &TableOption, meta: &Header) -> proc_macro2::TokenStream {
-    let mut id = table.ident.to_string();
+fn gen_rec_ident(table_ident: &Ident) -> Ident {
+    let mut id = table_ident.to_string();
     id.push_str("Rec");
-    let mut f = File::open(&options.path).expect("Fail to find the dbf file");
-    let mut fields = block_on(foxpro::read_fields(&mut f, meta));
-    if options.include.len() > 0 {
-        let exclusion = build_exclusion_list(&options.include, &fields);
-        remove_unused_fields(&mut fields, &exclusion);
-    } else {
-        remove_unused_fields(&mut fields, &options.exclude);
-    }
-    sort_fields_by_offset(&mut fields);
-    let fields_def = build_foxpro_fields(&fields, &options.parse_strategy);
-    let id = format_ident!("{}", id);
-    let vis = &table.vis;
+    format_ident!("{}", id)
+}
+
+fn generate_foxpro_rec_struct(vis: &Visibility, id: &Ident, parse_strategy: &RecordParsingStrategy, fields: &mut [foxpro::Field], meta: &Header) -> proc_macro2::TokenStream {
+    sort_fields_by_offset(fields);
+    let fields_def = build_foxpro_fields(&fields, parse_strategy);
     let rec_def = quote! {
         #vis struct #id {
             #(#fields_def),*
         }
     };
-    let impl_recops = implement_foxpro_recordops(&id, &options.parse_strategy, fields.as_slice());
+
+    let impl_recops = implement_foxpro_recordops(&id, parse_strategy, &meta, fields);
+    let impl_clone = impl_rec_clone(&id, fields);
 
     quote! {
         #rec_def
+        #impl_clone
         #impl_recops
     }
 }
@@ -559,15 +557,22 @@ fn build_exclusion_list(include: &[String], fields: &[impl FieldMeta]) -> Vec<St
     ).collect()
 }
 
-fn remove_unused_fields(fields: &mut Vec<impl FieldMeta>, excluded: &[String]) {
+/// Remove field(s) from `fields` slice that are in both `fields` and `excluded` slice. 
+/// Return true if one or more excluded field is mandatory (disallow null).
+fn remove_unused_fields(fields: &mut Vec<impl FieldMeta>, excluded: &[String]) -> bool {
+    let mut excluded_mandatory = false;
     excluded.iter().for_each(|e| {
         for i in 0..fields.len() {
             if fields[i].name() == e {
                 fields.remove(i);
+                if !fields[i].nullable() {
+                    excluded_mandatory = true
+                }
                 break;
             }
         }
     });
+    excluded_mandatory
 }
 
 fn sort_fields_by_offset(fields: &mut[impl FieldMeta]) {
@@ -576,32 +581,96 @@ fn sort_fields_by_offset(fields: &mut[impl FieldMeta]) {
     });
 }
 
+/// Generate field definition and wrap the type with `Option` if it's nullable.
+/// Otherwise, it will define type as is.
+macro_rules! field_quote {
+    ($nullable: expr, #$field: ident : $dec: ty) => {
+        let wrapped = if $nullable {
+            quote! {
+                Option<#$dec>
+            }
+        } else {
+            quote! {$dec}
+        };
+
+        quote! {
+            #$field: #wrapped
+        }
+    };
+}
+
 fn build_foxpro_fields(fields: &[impl FieldMeta], strategy: &RecordParsingStrategy) -> Vec<proc_macro2::TokenStream> {    
     match strategy {
         RecordParsingStrategy::Conversion => {
             fields.into_iter().map(|f| {
-                let name = f.name();
+                let name = format_ident!("{}", f.name());
                 match f.datatype_flag() {
                     b'B' => {
-                        quote! {
-                            #name : f64
+                        field_quote! {
+                            f.nullable(),
+                            #name : adbf_rs::foxpro::RawDoubleField
                         }
                     },
                     b'C' => {
-                        quote! {
+                        field_quote! {
+                            f.nullable(),
                             #name : adbf_rs::foxpro::RawCharField
                         }
                     },
                     b'D' => {
-                        quote! {
+                        field_quote! {
+                            f.nullable(),
                             #name : adbf_rs::foxpro::RawDateField
+                        }
+                    },
+                    b'T' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name : adbf_rs::foxpro::RawDateTimeField
                         }
                     }
                     b'N' | b'F' => {
-                        quote! {
+                        field_quote! {
+                            f.nullable(),
                             #name: adbf_rs::foxpro::RawFloatField
                         }
-                    }
+                    },
+                    b'G' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name: adbf_rs::foxpro::RawGeneralField
+                        }    
+                    },
+                    b'I' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name: adbf_rs::foxpro::RawIntegerField
+                        }    
+                    },
+                    b'L' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name: adbf_rs::foxpro::RawBool
+                        }    
+                    },
+                    b'V' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name : adbf_rs::foxpro::RawVarCharField
+                        }
+                    },
+                    b'Y' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name : adbf_rs::foxpro::RawCurrencyField
+                        }
+                    },
+                    b'Q' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name : adbf_rs::foxpro::RawVarBin
+                        }
+                    },
                     _ => {
                         panic!("Not yet implemented for {:#x} data type", f.datatype_flag())
                     }
@@ -610,29 +679,63 @@ fn build_foxpro_fields(fields: &[impl FieldMeta], strategy: &RecordParsingStrate
         },
         RecordParsingStrategy::Parse => {
             fields.into_iter().map(|f| {
-                let name = f.name();
+                let name = format_ident!("{}", f.name());
 
                 match f.datatype_flag() {
-                    b'B' => {
-                        quote! {
+                    b'B' | b'Y' => {
+                        field_quote! {
+                            f.nullable(),
                             #name : f64
                         }
                     },
-                    b'C' => {
-                        quote! {
-                            #name: String
+                    b'C' | b'V' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name : String
                         }
                     },
                     b'D' => {
-                        quote! {
+                        field_quote! {
+                            f.nullable(),
                             #name : chrono::NaiveDate
                         }
                     }
                     b'N' | b'F' => {
-                        quote! {
+                        field_quote! {
+                            f.nullable(),
                             #name: f32
                         }
-                    }
+                    },
+                    b'T' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name: chrono::NaiveDateTime
+                        }    
+                    },
+                    b'G' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name: u32
+                        }    
+                    },
+                    b'I' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name: i32
+                        }    
+                    },
+                    b'L' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name: bool
+                        }    
+                    },
+                    b'Q' => {
+                        field_quote! {
+                            f.nullable(),
+                            #name: Vec<u8>
+                        }    
+                    },
                     _ => {
                         panic!("Not yet implemented for {:#x} data type", f.datatype_flag())
                     }
@@ -642,30 +745,653 @@ fn build_foxpro_fields(fields: &[impl FieldMeta], strategy: &RecordParsingStrate
     }
 }
 
-fn implement_foxpro_recordops(name: &Ident, strategy: &RecordParsingStrategy, fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
+fn implement_foxpro_recordops(name: &Ident, strategy: &RecordParsingStrategy, meta: &Header, fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
     
     let from_bytes = match strategy {
-        RecordParsingStrategy::Conversion => implement_foxpro_record_conversion(fields),
-        RecordParsingStrategy::Parse => implement_foxpro_record_parse(fields)
+        RecordParsingStrategy::Conversion => implement_foxpro_record_conversion(name, meta.codepage, fields),
+        RecordParsingStrategy::Parse => implement_foxpro_record_parse(name, meta.codepage, fields)
     };
+
+    let to_bytes = match strategy {
+        RecordParsingStrategy::Conversion => implement_foxpro_to_bytes_conversion(meta.record_len, fields),
+        RecordParsingStrategy::Parse => implement_foxpro_to_bytes_parse(meta.record_len, meta.codepage, fields)
+    };
+    
     quote! {
         impl RecordOps for #name {
-            fn from_bytes(record: &[u8]) -> Self {
-                todo!("Implement conversion/parsing based on requirement")
-            }
-            fn to_bytes(&self) -> Vec<u8> {
-                todo!("Return an owned vec of byte")
+            #from_bytes
+
+            #to_bytes
+            // fn to_bytes(&self) -> Vec<u8> {
+            //     todo!("Return an owned vec of byte")
+            // }
+        }
+    }
+}
+
+/// Implement clone for all the types of record
+fn impl_rec_clone(rec_iden: &Ident, fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
+    let clone_fields = fields.iter().map(|f| {
+        let field_name = format_ident!("{}", f.name());
+        quote! {
+            #field_name: self.#field_name.clone()
+        }
+    });
+    quote! {
+        impl Clone for #rec_iden {
+            fn clone(&self) -> #rec_iden {
+                #rec_iden {
+                    #(#clone_fields),*
+                }
             }
         }
     }
 }
 
-fn implement_foxpro_record_conversion(fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
-    todo!()
+/// Utility macro to generate fields by given nullable parameter,
+/// field name, and proc_macro2::TokenStream of field instantiation.
+/// If nullable is `true`, it'll wrap the field instantiation with 
+/// `Option::Some()`.
+/// The field instantiation statement must be wrap in quote! macro.
+/// This macro doesn't evaluate any instantiate statement.
+macro_rules! field_assign_quote {
+    ($nullable: expr, #$field: ident : $dec: expr) => {
+        let wrapped = if $nullable {
+            quote! {
+                Option::Some(#$dec)
+            }
+        } else {
+            $dec
+        };
+        quote! {
+            #$field: #wrapped
+        }
+    };
 }
 
-fn implement_foxpro_record_parse(fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
-    todo!()
+fn implement_foxpro_record_conversion(rec_struct_ident: &Ident, codepage: &str, fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
+    let conversions = fields.iter().map(|f| {
+        let bytes = quote! {
+            &record[f.rec_offset()..(f.rec_offset() + f.size())]
+        };
+        // boolean need single byte. byte is cheap to copy so simply copy it.
+        let byte = quote! {
+            record[f.rec_offset()]
+        };
+        let field_name = format_ident!("{}", f.name());
+        let int = f.size(); // for numeric, it's integer part. For varchar/varbin, it's length of field.
+        let prec = f.precision();
+        let datatype = f.datatype_flag();
+        let instantiate_stmt = match datatype {
+            b'B' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawDoubleField {
+                            bytes: #bytes
+                        }
+                    }
+                }
+            },
+            b'C' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawCharField {
+                            bytes: #bytes,
+                            encoding: #codepage
+                        }
+                    }
+                }
+            },
+            b'D' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawDateField {
+                            bytes: #bytes
+                        }
+                    }
+                }
+            },
+            b'T' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawDateTimeField {
+                            bytes: #bytes
+                        }
+                    }
+                }
+            }
+            b'N' | b'F' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawFloatField {
+                            bytes: #bytes,
+                            integer: #int,
+                            precision: #prec
+                        }
+                    }
+                }
+            },
+            b'G' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawGeneralField {
+                            bytes: #bytes
+                        }
+                    }
+                }    
+            },
+            b'I' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawIntegerField {
+                            bytes: #bytes
+                        }
+                    }
+                }    
+            },
+            b'L' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawBool {
+                            byte: #byte
+                        }
+                    }
+                }    
+            },
+            b'V' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawVarCharField {
+                            bytes: #bytes,
+                            encoding: #codepage,
+                            max_length: #int
+                        }
+                    }
+                }
+            },
+            b'Y' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawCurrencyField {
+                            bytes: #bytes
+                        }
+                    }
+                }
+            },
+            b'Q' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {
+                        adbf_rs::foxpro::RawVarBin {
+                            bytes: #bytes,
+                            max_length: #int
+                        }
+                    }
+                }
+            },
+            _ => {
+                panic!("Not yet implemented for {:#x} data type", datatype)
+            }
+        };
+        instantiate_stmt
+    });
+
+    quote! {
+        fn from_bytes(record: &[u8]) -> Self {
+            #rec_struct_ident {
+                #(#conversions),*
+            }
+        }
+    }
+}
+
+fn implement_foxpro_record_parse(rec_struct_ident: &Ident, encoding: &str, fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
+    let conversions = fields.iter().map(|f| {
+        let offset = f.rec_offset();
+        let int = f.size(); // for numeric, it's integer part. For varchar/varbin, it's length of field.
+        let bytes = quote! {
+            record[#offset..(#offset + #int)]
+        };
+        // boolean need single byte. byte is cheap to copy so simply copy it.
+        let byte = quote! {
+            record[#offset]
+        };
+        let field_name = format_ident!("{}", f.name());
+        let prec = f.precision();
+        let datatype = f.datatype_flag();
+        let instantiate_stmt = match datatype {
+            b'B' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote!{f64::from_le_bytes(#bytes.try_into().unwrap())}
+                }
+            },
+            b'C' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! ({
+                        let mut value = String::with_capacity(#int);
+                        let (reason, readed, _) = adbf_rs::get_decoder(#encoding).decode_to_string(&#bytes, &mut value, true);
+                        if readed != #int {
+                            match reason {
+                                encoding_rs::CoderResult::InputEmpty => {
+                                    panic!("Insufficient record data. Expect {} but found {}", #int, readed)
+                                },
+                                encoding_rs::CoderResult::OutputFull => {
+                                    panic!("Insufficient buffer to store converted string")
+                                }
+                            };
+                        }
+                        value
+                    })
+                }
+            },
+            b'D' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {chrono::NaiveDate::from_num_days_from_ce(i32::from_le_bytes(#bytes[0..4].try_into().unwrap()))}
+                }
+            },
+            b'T' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! ({
+                        let mut date_part = chrono::NaiveDate::from_num_days_from_ce(i32::from_le_bytes(#bytes[0..4].try_into().unwrap()));
+                        let time_part = u32::from_le_bytes(self.bytes[4..8].try_into().unwrap());
+                        date_part.and_hms((time_part / 3_600_000) % 24, (time_part / 60_000) % 60, (time_part / 1000) % 60)
+                        date_part
+                    })
+                }
+            }
+            b'N' | b'F' => {
+                field_assign_quote! {
+                    f.nullable(), 
+                    #field_name: quote! ({
+                        let mut buffer = String::with_capacity(#bytes.len());
+                        let (result, readed, _) = adbf_rs::get_decoder("ISO-8859-1").decode_to_string(&#bytes, &mut buffer, true);
+                        if readed != #int + #prec {
+                            match result {
+                                encoding_rs::CoderResult::InputEmpty => panic!("Insufficient input to read for Numeric/Float field. Please report an issue."),
+                                encoding_rs::CoderResult::OutputFull => panic!("Insufficient buffer to write for Numeric/Float field. Please report an issue.")
+                            }
+                        }
+                        buffer.parse().expect("Fail to convert buffered string to float. Please file an issue.")
+                    })
+                }
+            },
+            b'G' => {
+                field_assign_quote! {
+                    f.nullable(), 
+                    #field_name: quote! {u32::from_bytes(#bytes.try_into().unwrap())}
+                }    
+            },
+            b'I' => {
+                field_assign_quote! {
+                    f.nullable(), 
+                    #field_name: quote! {i32:from_le_bytes(#bytes.try_into().unwrap())}
+                }    
+            },
+            b'L' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! {#byte > 0}
+                }    
+            },
+            b'V' => {
+                field_assign_quote! {
+                    f.nullable(),
+                    #field_name: quote! ({
+                        let value = String::with_capacity(#int);
+                        let (reason, readed, _) = adbf_rs::get_decoder(#encoding).decode_to_string(&#bytes, &mut value, true);
+                        if readed != #int {
+                            match reason {
+                                encoding_rs::CoderResult::InputEmpty => {
+                                    panic!("Insufficient record data. Expect {} but found {}", #int, readed)
+                                },
+                                encoding_rs::CoderResult::OutputFull => {
+                                    panic!("Insufficient buffer to store converted string")
+                                }
+                            }
+                        }
+                        value
+                    })
+                }
+            },
+            b'Y' => {
+                field_assign_quote! {
+                    f.nullable(), 
+                    #field_name: quote! {(i64::from_le_bytes(#bytes.try_into().expect("Fail to convert to currency")) as f64) / 10_000f64}
+                }
+            },
+            b'Q' => {
+                field_assign_quote! {
+                    f.nullable(), 
+                    #field_name: quote! {#bytes.to_owned()}
+                }
+            },
+            _ => {
+                panic!("Not yet implemented for {:#x} data type", datatype)
+            }
+        };
+        instantiate_stmt
+    });
+
+    quote! {
+        fn from_bytes(record: &[u8]) -> Self {
+            #rec_struct_ident {
+                #(#conversions),*
+            }
+        }
+    }
+}
+
+fn implement_foxpro_to_bytes_conversion(len: usize, fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
+    let byte_copies = fields.iter().map(|f| {
+        let name = f.name();
+        let offset = f.rec_offset();
+        let size = f.size();
+        let end = offset + size;
+
+        if f.nullable() {
+            quote! {
+                if let Some(bytes) = self.#name.bytes {
+                    result[#offset..#end].iter_mut().zip(bytes.iter()).for_each(|(r, b)| *r = *b);
+                }
+            }
+        } else {
+            quote! {
+                result[#offset..#end].iter_mut().zip(self.#name.bytes.iter()).for_each(|(r, b)| *r = *b);
+            }
+        }
+    });
+    quote! {
+        // #to_bytes
+        fn to_bytes(&self) -> Vec<u8> {
+            let mut result = vec![0;#len];
+            #(#byte_copies)*
+            result
+        }
+    }
+}
+
+fn implement_foxpro_to_bytes_parse(len: usize, encoding: &str, fields: &[impl FieldMeta]) -> proc_macro2::TokenStream {
+    let mut prev_end = 0;
+    let converted = fields.iter().map(|f| {
+        let name = format_ident!("{}",f.name());
+        let name_str = f.name();
+        let offset = f.rec_offset();
+        let size = f.size();
+        let precision = f.precision();
+        let datatype = f.datatype_flag();
+
+        let maybe_pad_quote = if offset > prev_end {
+            quote! {
+                bytes.append(&mut vec![0; #offset - #prev_end]);
+            } 
+        } else {
+            quote! {}
+        };
+
+        prev_end = offset + size;
+
+        if f.nullable() {
+            quote! {
+                #maybe_pad_quote
+                if let Some(v) = self.#name {
+                    bytes.append(v.to_le_bytes());
+                } else {
+                    bytes.append([0;#size]);
+                }
+            }
+        } else {
+            let encoded = match datatype {
+                b'B' | b'G' | b'I' => { // Double, General, Integer have to_le_bytes function
+                    quote! {
+                        bytes.extend(&self.#name.to_le_bytes());
+                    }
+                },
+                b'C' | b'V' => {
+                    quote! {
+                        {
+                            let mut buffer = vec![0; #size];
+                            let (result, _, _, _) = adbf_rs::get_encoder(#encoding).encode_from_utf8(&self.#name, &mut buffer, true);
+                            match result {
+                                encoding_rs::CoderResult::InputEmpty => bytes.append(&mut buffer),
+                                encoding_rs::CoderResult::OutputFull => panic!("Input too large for field {}", #name_str)
+                            }
+                        }
+                    }
+                },
+                b'D' => {
+                    quote! {
+                        let mut buffer = [0;4];
+                        adbf_core_rs::foxpro::date_to_bytes(&self.#name, &mut buffer);
+                        bytes.extend(&buffer);
+                    }
+                },
+                b'T' => {
+                    quote! {
+                        let mut buffer = [0;8];
+                        adbf_core_rs::foxpro::date_time_to_bytes(&self.#name, &mut buffer);
+                        bytes.extend(&buffer);
+                    }
+                },
+                b'N' | b'F' => {
+                    quote! {
+                        {
+                            let mut buffer = vec![0; #size];
+                            let float_str = format!("{0:0>0decimal$.precision$}", self.#name, decimal=#size - #precision, precision=#precision);
+                            let (result, _, writen,_) = adbf_rs::get_encoder("ISO-8859-1").encode_from_utf8(&float_str, &mut buffer, true);
+                            if writen != #size {
+                                match result {
+                                    encoding_rs::CoderResult::InputEmpty => panic!("Insufficient input to read for Numeric/Float field. Please report an issue."),
+                                    encoding_rs::CoderResult::OutputFull => panic!("Insufficient buffer to write for Numeric/Float field. Please report an issue.")
+                                }
+                            }
+                            bytes.append(&mut buffer);
+                        }
+                    }
+                },
+                b'L' => {
+                    quote! {
+                        if self.#name {
+                            bytes.push(1u8);
+                        } else {
+                            bytes.push(0);
+                        }
+                    }
+                },
+                b'Y' => {
+                    quote! {
+                        bytes.extend(&((self.#name * 10_000) as i64).to_le_bytes());
+                    }
+                },
+                b'Q' => {
+                    quote! {
+                        bytes.extend(&self.#name);
+                    }
+                },
+                _ => {
+                    panic!("Not yet implemented for {:#x} data type", datatype)
+                }
+            };
+
+            quote! {
+                #maybe_pad_quote
+                #encoded
+            }
+        }
+    });
+
+    quote! {
+        // #to_bytes
+        fn to_bytes(&self) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(#len);
+            #(#converted)*
+            bytes
+        }
+    }
+}
+
+macro_rules! interior_mut_ident {
+    () => {
+        quote! { std::cell::RefCell }
+    };
+}
+
+#[cfg(feature="threaded")]
+macro_rules! interior_mut_ident {
+    () => {
+        quote! { std::sync::RwLock }
+    };
+}
+
+fn define_table(vis: &Visibility, table_iden: &Ident, rec_iden: &Ident, load_strategy: &TableLoadStrategy) -> proc_macro2::TokenStream {
+    let int_mut = interior_mut_ident!();
+    let lazy_recs_type = quote! {Vec<Option<#int_mut<#rec_iden>>>};
+    match load_strategy {
+        TableLoadStrategy::Eager => {
+            quote! {
+                #vis struct #table_iden {
+                    recs: Vec<#rec_iden>
+                }
+            }
+        },
+        TableLoadStrategy::Lazy => {
+            quote! {
+                #vis struct #table_iden {
+                    file: String,
+                    recs: #lazy_recs_type
+                }
+            }
+        }
+    }
+}
+
+fn impl_table(table_iden: &Ident, load_strategy: &TableLoadStrategy, first_rec_offset: usize, rec_size: usize, dbf_file: &str) -> proc_macro2::TokenStream {
+    // let interior_mut = interior_mut_ident!();
+    let instantiate_stmt = match load_strategy {
+        TableLoadStrategy::Eager => quote! {
+            use std::io::{Read, Seek};
+
+            #table_iden {
+                recs: {
+                    let file = std::io::File::open(#dbf_file).unwrap();
+                    let mut buff = Vec::new();
+                    if let Ok(loc) = file.seek(std::io::SeekFrom::Start(#first_rec_offset)) {
+                        file.read_to_end(&mut buff);
+                        return buff.as_slice().windows(#rec_size).step_by(#rec_size).collect();
+                    } else {
+                        panic!("File {} is corrupted", #dbf_file)
+                    }
+                }
+            }
+        },
+        TableLoadStrategy::Lazy => quote! {
+            #table_iden {
+                file: #dbf_file.to_owned(),
+                recs: Vec::new()
+            }
+        }
+    };
+
+    quote! {
+        impl #table_iden {
+            fn new() -> #table_iden {
+                #instantiate_stmt
+            }
+        }
+    }
+}
+
+// It cannot be done using index trait. The Index trait take &self as parameter but lazily load require to mut self.
+// Thus it will require interior mutability on field to be access.
+// Those interior mutability type will return arbitary type such as Ref for RefCell or RwLockReadGuard for RwLock.
+// These two types lifetime will be ended inside the index function while the return reference needed to outlive
+// this function.
+// To make this work, create a new struct that implement Future trait then return the struct instead.
+// However, this make caller responsible for buffering the readed value as each index will return
+// new struct that also implement the same Future. Otherwise, each time the .await is call on future, it'll
+// load content from file.
+// fn impl_index_ops(table_ident: &Ident, rec_ident: &Ident, load_strategy: &TableLoadStrategy, first_rec_offset: usize, rec_size: usize) -> proc_macro2::TokenStream {
+//     // let read_recs = quote! { (&*self.recs.borrow()) };
+//     // #[cfg(feature="threaded")]
+//     // let read_recs = quote! { (&*self.recs.read().unwrap()) };
+//     // let mut_recs = quote! { (&mut *self.recs.borrow_mut()) };
+//     // #[cfg(feature="threaded")]
+//     // let mut_recs = quote! { (&mut *self.recs.write().unwrap()) };
+//     // let lock_type = quote! { std::cell::Ref };
+//     let int_mut_ident = interior_mut_ident!();
+
+//     let access = match load_strategy {
+//         TableLoadStrategy::Eager => {
+//             quote! {
+//                 #rec_ident::from_bytes(self.bytes[index])
+//             }
+//         },
+//         TableLoadStrategy::Lazy => {
+//             quote! {
+//                 fn read_at(f: &str, o: u64) -> #rec_ident {
+//                     use std::io::{Seek, SeekFrom, Read};
+//                     let mut fp = std::fs::File::open(f).unwrap();
+//                     let pos = fp.seek(SeekFrom::Start(o)).unwrap();
+//                     let mut bytes = Vec::with_capacity(#rec_size);
+//                     unsafe {
+//                         bytes.set_len(#rec_size);
+//                     }
+//                     fp.read_exact(&mut bytes).unwrap();
+//                     #rec_ident::from_bytes(bytes.as_slice())
+//                 }
+//                 let n = self.recs.len();
+//                 if index < n {
+//                     if let Some(ref r) = self.recs[index] {
+//                         return r;
+//                     }
+
+//                     self.recs[index] = Some(#int_mut_ident::new(read_at(&self.file, (#first_rec_offset + index * #rec_size) as u64)));
+//                 } else {
+//                     for _ in (n..index) {
+//                         self.recs[index] = None
+//                     }
+    
+//                     self.recs[index] = Some(#int_mut_ident::new(read_at(&self.file, (#first_rec_offset + index * #rec_size) as u64)));
+//                 }
+                
+//                 if let Some(ref r) = self.recs[index] {
+//                     r
+//                 } else {
+//                     panic!("Fail to assign new record into existing buffer")
+//                 }
+//             } 
+//         }
+//     };
+
+//     quote! {
+
+//         impl std::ops::Index<usize> for #table_ident {
+//             type Output=#int_mut_ident<#rec_ident>;
+
+//             fn index(&self, index: usize) -> &#int_mut_ident<#rec_ident> {
+//                 #access
+//             }
+//         }
+//     }
+// }
+
+fn impl_table_ops(table_ident: &Ident, rec_ident: &Ident) -> proc_macro2::TokenStream {
+    quote! {
+
+    }
 }
 
 #[proc_macro_attribute]
@@ -674,7 +1400,7 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
     println!("raw_meta={:?}", type_meta);
     let table_options = TableOption::from(type_meta);
     println!("parsed_meta={:?}", table_options);
-    let ast : ItemStruct = syn::parse(item).expect("Expected to `table` attribute macro to be used with struct.");
+    let ast : ItemStruct = syn::parse(item).expect("Expected `table` attribute macro to be used with struct.");
     match ast.fields {
         syn::Fields::Unit => (),
         _ => {
@@ -682,23 +1408,36 @@ pub fn table(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
     let dbf_type = get_dbf_type(&table_options.path);
-    println!("{:?}", ast);
     let rec;
+    let impl_tab;
+    // let impl_tab_idx;
+    let tab;
     match dbf_type {
         DBFType::VisualFoxPro => {
             let table_meta = block_on(read_header(&table_options.path, foxpro::cp_mapper)).expect("Fail to read table meta data");
-            rec = generate_foxpro_rec_struct(&ast, &table_options, &table_meta);
+            impl_tab = impl_table(&ast.ident, &table_options.load_strategy, table_meta.first_record_position, table_meta.record_len, &table_options.path);
+            
+            let mut f = File::open(&table_options.path).expect("Fail to find the dbf file");
+            let mut fields = block_on(foxpro::read_fields(&mut f, &table_meta));
+            let mut insertable = if table_options.include.len() > 0 {
+                let exclusion = build_exclusion_list(&table_options.include, &fields);
+                remove_unused_fields(&mut fields, &exclusion)
+            } else {
+                remove_unused_fields(&mut fields, &table_options.exclude)
+            };
+            let rec_id = gen_rec_ident(&ast.ident);
+            tab = define_table(&ast.vis, &ast.ident, &rec_id, &table_options.load_strategy);
+            rec = generate_foxpro_rec_struct(&ast.vis, &rec_id, &table_options.parse_strategy, fields.as_mut_slice(), &table_meta);
+            // impl_tab_idx = impl_index_ops(&ast.ident, &rec_id, &table_options.load_strategy, table_meta.first_record_position, table_meta.record_len);
         },
         _ => {
             unimplemented!("The {:?} is not yet support", dbf_type);
         }
     }
-    println!("{:?}", quote! {
-        #ast
-        #rec
-    });
     TokenStream::from(quote! {
-        #ast
+        #tab
+        #impl_tab
+        // #impl_tab_idx
         #rec
     })
 }

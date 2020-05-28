@@ -1,4 +1,13 @@
+#[cfg(feature="threaded")]
+extern crate adbf_rs_threaded as adbf_rs;
+
 use adbf_rs::{FieldMeta, Header};
+use chrono::{
+    naive:: {
+        NaiveDate,
+        NaiveDateTime
+    }
+};
 use core::fmt::Display;
 use encoding_rs::{CoderResult, Decoder, Encoding};
 use std::fmt;
@@ -105,7 +114,8 @@ fn read_field_meta(bytes: [u8; 32], decoder: &mut Decoder) -> Option<Field> {
     let next_step = bytes[24] as u32;
 
     Some(Field {
-        name: field_name,
+        // remove null char as well as all surrounding white space then make it lower case
+        name: field_name.trim().trim_matches(char::from(0)).to_lowercase(), 
         datatype_flag: field_type,
         offset: offset,
         size: size,
@@ -298,230 +308,3 @@ impl<'a> Display for CharField<'a> {
         write!(f, "{}", self.content)
     }
 }
-// impl<'a> FieldOps for CharField<'a> {
-
-//     fn from_record_bytes(&mut self) -> BoxFuture<()> {
-//         Box::pin(async move {
-//             let field = &self.record[self.meta.rec_offset()..(self.meta.rec_offset() + self.meta.size())];
-//             let (reason, readed, _) = get_decoder(self.codepage).decode_to_string(field, &mut self.content, true);
-//             if readed != self.meta.size() {
-//                 match reason {
-//                     CoderResult::InputEmpty => {
-//                         panic!("Insufficient record data. Expect {} but found {}", self.meta.size(), readed)
-//                     },
-//                     CoderResult::OutputFull => {
-//                         panic!("Insufficient buffer to store converted string")
-//                     }
-//                 }
-//             }
-//         })
-//     }
-
-//     fn to_bytes(&self) -> BoxFuture<&[u8]> {
-//         Box::pin(
-//             async move {
-//                 &self.record[self.meta.rec_offset()..(self.meta.size() + self.meta.rec_offset())]
-//             }
-//         )
-//     }
-
-//     fn ready(&self) -> bool {
-//         self.ready.is_some()
-//     }
-// }
-
-// #[derive(Clone)]
-// pub struct CurrencyField<'a> {
-//     pub meta: Field,
-//     content: String,
-//     ready: Option<()>,
-//     record: &'a [u8]
-// }
-
-// impl<'a> FieldMeta for CurrencyField<'a> {
-//     fn nullable(&self) -> bool {
-//         self.meta.nullable()
-//     }
-//     fn autoincrement(&self) -> bool {
-//         self.meta.autoincrement()
-//     }
-//     fn name(&self) -> &str {
-//         self.meta.name()
-//     }
-//     fn rec_offset(&self) -> usize {
-//         self.meta.rec_offset()
-//     }
-//     fn size(&self) -> usize {
-//         self.meta.size()
-//     }
-//     fn precision(&self) -> usize {
-//         self.meta.precision()
-//     }
-//     fn next_id(&mut self) -> u32 {
-//         self.meta.next_id()
-//     }
-// }
-
-// impl<'a> Display for CurrencyField<'a> {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         write!(f, "{}", self.content)
-//     }
-// }
-
-// impl<'a> FieldOps for CurrencyField<'a> {
-
-//     fn from_record_bytes(&mut self) -> BoxFuture<()> {
-//         Box::pin(async move {
-//             let field = &self.record[self.meta.rec_offset()..(self.meta.rec_offset() + self.meta.size())];
-            
-//             let raw = i64::from_le_bytes(field.try_into().unwrap());
-//             let integer = raw / 10000;
-//             let fraction = raw % 10000;
-//             self.content = format!("{}.{:04}", integer, fraction);
-//         })
-//     }
-
-//     fn to_bytes(&self) -> BoxFuture<&[u8]> {
-//         Box::pin(
-//             async move {
-//                 &self.record[self.meta.rec_offset()..(self.meta.rec_offset() + self.meta.size())]
-//             }
-//         )
-//     }
-
-//     fn ready(&self) -> bool {
-//         self.ready.is_some()
-//     }
-// }
-
-// #[derive(Clone)]
-// pub struct DateField<'a> {
-//     pub meta: Field,
-//     content: NaiveDate,
-//     ready: Option<()>,
-//     record: &'a [u8]
-// }
-
-// impl<'a> FieldMeta for DateField<'a> {
-//     fn nullable(&self) -> bool {
-//         self.meta.nullable()
-//     }
-//     fn autoincrement(&self) -> bool {
-//         self.meta.autoincrement()
-//     }
-//     fn name(&self) -> &str {
-//         self.meta.name()
-//     }
-//     fn rec_offset(&self) -> usize {
-//         self.meta.rec_offset()
-//     }
-//     fn size(&self) -> usize {
-//         self.meta.size()
-//     }
-//     fn precision(&self) -> usize {
-//         self.meta.precision()
-//     }
-//     fn next_id(&mut self) -> u32 {
-//         self.meta.next_id()
-//     }
-// }
-
-// impl<'a> Display for DateField<'a> {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         write!(f, "{}", self.content)
-//     }
-// }
-
-// impl<'a> FieldOps for DateField<'a> {
-
-//     fn from_record_bytes(&mut self) -> BoxFuture<()> {
-//         Box::pin(
-//             async move {
-//                 let field = &self.record[self.meta.rec_offset()..(self.meta.rec_offset() + self.meta.size())];
-//                 self.content = NaiveDate::from_num_days_from_ce(i64::from_le_bytes(field.try_into().unwrap()) as i32);
-//             }
-//         )
-//     }
-
-//     fn to_bytes(&self) -> BoxFuture<&[u8]> {
-//         Box::pin(
-//             async move {
-//                 &self.record[self.meta.rec_offset()..(self.meta.rec_offset() + self.meta.size())]
-//             }
-//         )
-//     }
-
-//     fn ready(&self) -> bool {
-//         self.ready.is_some()
-//     }
-// }
-
-// #[derive(Clone)]
-// pub struct DateTimeField<'a> {
-//     pub meta: Field,
-//     ready: Option<()>,
-//     content: NaiveDateTime,
-//     record: &'a [u8]
-// }
-
-// impl<'a> FieldMeta for DateTimeField<'a> {
-//     fn nullable(&self) -> bool {
-//         self.meta.nullable()
-//     }
-//     fn autoincrement(&self) -> bool {
-//         self.meta.autoincrement()
-//     }
-//     fn name(&self) -> &str {
-//         self.meta.name()
-//     }
-//     fn rec_offset(&self) -> usize {
-//         self.meta.rec_offset()
-//     }
-//     fn size(&self) -> usize {
-//         self.meta.size()
-//     }
-//     fn precision(&self) -> usize {
-//         self.meta.precision()
-//     }
-//     fn next_id(&mut self) -> u32 {
-//         self.meta.next_id()
-//     }
-// }
-
-// impl<'a> Display for DateTimeField<'a> {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         write!(f, "{}", self.content)
-//     }
-// }
-
-// impl<'a> FieldOps for DateTimeField<'a> {
-
-//     fn from_record_bytes(&mut self) -> BoxFuture<()> {
-//         Box::pin(
-//             async move {
-//                 let half : usize = self.meta.rec_offset() + self.meta.size() / 2;
-//                 let date_field = &self.record[self.meta.rec_offset()..half];
-//                 let time_field = &self.record[half..(self.meta.rec_offset() + self.meta.size())];
-//                 let naive_date = NaiveDate::from_num_days_from_ce(i32::from_le_bytes(date_field.try_into().unwrap()) - 1_721_426);
-//                 let milli_4_midnight = u32::from_le_bytes(time_field.try_into().unwrap());
-//                 self.content = naive_date.and_hms((milli_4_midnight / 3_600_000) % 24, (milli_4_midnight / 60_000) % 60, (milli_4_midnight / 1000) % 60);
-//             }
-//         )
-//     }
-
-//     fn to_bytes(&self) -> BoxFuture<&[u8]> {
-//         Box::pin(
-//             async move {
-//                 &self.record[self.meta.rec_offset()..(self.meta.rec_offset() + self.meta.size())]
-//             }    
-//         )
-//     }
-
-//     fn ready(&self) -> bool {
-//         self.ready.is_some()
-//     }
-// }
-
-// impl<T> RecordOps<T> for Record where T: FieldOps {
-
-// }
